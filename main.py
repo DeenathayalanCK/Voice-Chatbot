@@ -16,6 +16,7 @@ except ImportError:
 
 import numpy as np
 import sounddevice as sd
+from time import perf_counter
 
 from audio.recorder import record_audio, SAMPLE_RATE
 from stt.stt import transcribe, _load_model
@@ -50,19 +51,30 @@ def get_assistant_response(llm: BaseLLMClient, instruction: str) -> str:
     return llm.generate_response(instruction)
 
 
-def run_turn(llm: BaseLLMClient, session: SessionManager) -> tuple[str, str]:
+def run_turn(llm: BaseLLMClient, session: SessionManager) -> tuple[str, str, dict[str, float]]:
     """
     One full conversation turn:
       1. Capture voice → transcribe
       2. Validate + update session state
       3. Get LLM-phrased response
       4. Speak response aloud
-    Returns (user_text, assistant_text).
-    Returns ("", "") when no speech was captured.
+    Returns (user_text, assistant_text, metrics).
+    Returns ("", "", metrics) when no speech was captured.
     """
+    metrics = {
+        "user_wait": 0.0,
+        "stt": 0.0,
+        "llm": 0.0,
+        "tts": 0.0,
+        "processing_total": 0.0,
+        "total": 0.0,
+    }
+
+    turn_start = perf_counter()
     active_slot = session.current_slot()
 
     # Name capture can be short; relax minimum voiced frames slightly.
+    listen_start = perf_counter()
     if active_slot == "name":
         audio = record_audio(
             silence_duration=1.8,
@@ -81,19 +93,41 @@ def run_turn(llm: BaseLLMClient, session: SessionManager) -> tuple[str, str]:
         )
     else:
         audio = record_audio()
+    metrics["user_wait"] = perf_counter() - listen_start
 
+    stt_start = perf_counter()
     user_text   = transcribe(audio, hint=active_slot)
+    metrics["stt"] = perf_counter() - stt_start
 
     if not user_text:
-        return "", ""
+        metrics["processing_total"] = metrics["stt"]
+        metrics["total"] = perf_counter() - turn_start
+        return "", "", metrics
 
     session.update(user_text)
 
     instruction    = session.get_next_prompt()
+    llm_start = perf_counter()
     assistant_text = get_assistant_response(llm, instruction)
+    metrics["llm"] = perf_counter() - llm_start
 
+    tts_start = perf_counter()
     speak(assistant_text)
-    return user_text, assistant_text
+    metrics["tts"] = perf_counter() - tts_start
+
+    metrics["processing_total"] = metrics["stt"] + metrics["llm"] + metrics["tts"]
+    metrics["total"] = perf_counter() - turn_start
+    return user_text, assistant_text, metrics
+
+
+def _print_latency(metrics: dict[str, float]) -> None:
+    """Print turn-level latency metrics in seconds."""
+    print("[Latency] User wait: {:.1f}s".format(metrics["user_wait"]))
+    print("[Latency] STT: {:.1f}s".format(metrics["stt"]))
+    print("[Latency] LLM: {:.1f}s".format(metrics["llm"]))
+    print("[Latency] TTS: {:.1f}s".format(metrics["tts"]))
+    print("[Latency] Total (processing): {:.1f}s".format(metrics["processing_total"]))
+    print("[Latency] Total (incl. user wait): {:.1f}s".format(metrics["total"]))
 
 
 def run_session(llm: BaseLLMClient) -> None:
@@ -110,11 +144,12 @@ def run_session(llm: BaseLLMClient) -> None:
     silent_turns = 0
 
     while not session.is_complete() and not session.is_failed():
-        user_text, response = run_turn(llm, session)
+        user_text, response, metrics = run_turn(llm, session)
 
         if not user_text:
             silent_turns += 1
             print(f"[main] No speech captured (silent turn #{silent_turns}).")
+            _print_latency(metrics)
 
             if silent_turns >= SILENCE_RETRY_AFTER:
                 speak(SILENCE_RETRY_PROMPT)
@@ -125,6 +160,7 @@ def run_session(llm: BaseLLMClient) -> None:
         silent_turns = 0
         print(f"[You]       {user_text}")
         print(f"[Assistant] {response}")
+        _print_latency(metrics)
 
         # After a valid response, beep to signal we're ready for the next input
         if not session.is_complete() and not session.is_failed():
