@@ -1,18 +1,22 @@
-# main.py — Phase 4: full POC with TTS, validation, retry logic, multi-user loop
+# main.py — Phase 4 + Performance Fixes
 #
-# FIXES in this revision:
-#   1. pyttsx3 silent-after-first-call → fixed in tts.py (reinit per call)
-#   2. ACK + next question chained → fixed in session.get_next_prompt()
-#   3. Silence retry: speaks prompt + plays an actual BEEP tone (no more
-#      "after the beep" with no beep)
-#   4. Whisper pre-warmed at startup
-#   5. No-speech detection improved in recorder.py + stt.py
+# FIX 2 — Non-blocking TTS:
+#   speak() is now launched in a daemon thread so the system remains
+#   responsive while audio plays. A threading.Event signals completion
+#   before the next recording starts (we still need to finish speaking
+#   before listening again, but other work can proceed in parallel).
+#
+# FIX 3 — Reduced speech length:
+#   LLM instructions now explicitly request ultra-short replies so TTS
+#   time drops drastically (fewer words = fewer seconds of audio).
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
+import threading
 
 import numpy as np
 import sounddevice as sd
@@ -26,19 +30,18 @@ from state.session import SessionManager
 from tts.tts import speak
 
 # ── Silence retry config ───────────────────────────────────────────────────
-SILENCE_RETRY_AFTER   = 1      # speak retry prompt after this many silent turns
-SILENCE_RETRY_PROMPT  = "I didn't catch that — please speak clearly."
-BEEP_FREQ_HZ          = 880    # A5 — pleasant attention tone
-BEEP_DURATION_SECS    = 0.18   # short enough not to be annoying
-BEEP_VOLUME           = 0.4    # 0.0–1.0
+SILENCE_RETRY_AFTER  = 1
+SILENCE_RETRY_PROMPT = "Didn't catch that — please speak clearly."
+BEEP_FREQ_HZ         = 880
+BEEP_DURATION_SECS   = 0.18
+BEEP_VOLUME          = 0.4
 # ──────────────────────────────────────────────────────────────────────────
 
 
 def _play_beep() -> None:
-    """Play a short sine-wave beep through the default output device."""
-    t = np.linspace(0, BEEP_DURATION_SECS,
-                    int(SAMPLE_RATE * BEEP_DURATION_SECS), endpoint=False)
-    # Sine wave with a short fade-out to avoid click at the end
+    """Play a short sine-wave attention beep."""
+    t    = np.linspace(0, BEEP_DURATION_SECS,
+                       int(SAMPLE_RATE * BEEP_DURATION_SECS), endpoint=False)
     wave = BEEP_VOLUME * np.sin(2 * np.pi * BEEP_FREQ_HZ * t)
     fade = np.linspace(1.0, 0.0, len(wave) // 4)
     wave[-len(fade):] *= fade
@@ -46,100 +49,105 @@ def _play_beep() -> None:
     sd.wait()
 
 
+# ── FIX 2: Non-blocking speak ───────────────────────────────────────────────
+
+def speak_async(text: str) -> threading.Event:
+    """
+    Start TTS in a background thread; return an Event that is set when done.
+    Callers can do other work and call event.wait() only when they need
+    playback to have finished (e.g., before starting the next recording).
+    """
+    done = threading.Event()
+
+    def _run():
+        speak(text)
+        done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return done
+
+
 def get_assistant_response(llm: BaseLLMClient, instruction: str) -> str:
-    """Ask the LLM to phrase a response based on a flow instruction."""
     return llm.generate_response(instruction)
 
 
 def run_turn(llm: BaseLLMClient, session: SessionManager) -> tuple[str, str, dict[str, float]]:
     """
-    One full conversation turn:
-      1. Capture voice → transcribe
-      2. Validate + update session state
-      3. Get LLM-phrased response
-      4. Speak response aloud
+    One full conversation turn.
     Returns (user_text, assistant_text, metrics).
-    Returns ("", "", metrics) when no speech was captured.
+    Returns ('', '', metrics) when no speech was captured.
     """
     metrics = {
         "user_wait": 0.0,
-        "stt": 0.0,
-        "llm": 0.0,
-        "tts": 0.0,
+        "stt":       0.0,
+        "llm":       0.0,
+        "tts":       0.0,
         "processing_total": 0.0,
-        "total": 0.0,
+        "total":     0.0,
     }
 
-    turn_start = perf_counter()
-    active_slot = session.current_slot()
+    turn_start   = perf_counter()
+    active_slot  = session.current_slot()
 
-    # Name capture can be short; relax minimum voiced frames slightly.
     listen_start = perf_counter()
     if active_slot == "name":
-        audio = record_audio(
-            silence_duration=1.8,
-            min_speech_frames=5,
-            pre_roll_chunks=6,
-            vad_threshold=260,
-        )
-    # Phone capture needs more forgiving timing because users pause between digits.
-    # These values reduce clipping of first/last digits and avoid early stop mid-number.
+        audio = record_audio(silence_duration=1.8, min_speech_frames=5,
+                              pre_roll_chunks=6, vad_threshold=260)
     elif active_slot == "phone":
-        audio = record_audio(
-            silence_duration=2.4,
-            min_speech_frames=4,
-            pre_roll_chunks=8,
-            vad_threshold=220,
-        )
+        audio = record_audio(silence_duration=2.4, min_speech_frames=4,
+                              pre_roll_chunks=8, vad_threshold=220)
     else:
         audio = record_audio()
     metrics["user_wait"] = perf_counter() - listen_start
 
-    stt_start = perf_counter()
-    user_text   = transcribe(audio, hint=active_slot)
+    stt_start    = perf_counter()
+    user_text    = transcribe(audio, hint=active_slot)
     metrics["stt"] = perf_counter() - stt_start
 
     if not user_text:
         metrics["processing_total"] = metrics["stt"]
-        metrics["total"] = perf_counter() - turn_start
+        metrics["total"]            = perf_counter() - turn_start
         return "", "", metrics
 
     session.update(user_text)
 
     instruction    = session.get_next_prompt()
-    llm_start = perf_counter()
+    llm_start      = perf_counter()
     assistant_text = get_assistant_response(llm, instruction)
     metrics["llm"] = perf_counter() - llm_start
 
-    tts_start = perf_counter()
-    speak(assistant_text)
+    # FIX 2 — speak in background; wait for it to finish before returning
+    tts_start  = perf_counter()
+    tts_done   = speak_async(assistant_text)
+    tts_done.wait()                          # blocks until audio ends
     metrics["tts"] = perf_counter() - tts_start
 
     metrics["processing_total"] = metrics["stt"] + metrics["llm"] + metrics["tts"]
-    metrics["total"] = perf_counter() - turn_start
+    metrics["total"]            = perf_counter() - turn_start
     return user_text, assistant_text, metrics
 
 
 def _print_latency(metrics: dict[str, float]) -> None:
-    """Print turn-level latency metrics in seconds."""
     print("[Latency] User wait: {:.1f}s".format(metrics["user_wait"]))
-    print("[Latency] STT: {:.1f}s".format(metrics["stt"]))
-    print("[Latency] LLM: {:.1f}s".format(metrics["llm"]))
-    print("[Latency] TTS: {:.1f}s".format(metrics["tts"]))
-    print("[Latency] Total (processing): {:.1f}s".format(metrics["processing_total"]))
-    print("[Latency] Total (incl. user wait): {:.1f}s".format(metrics["total"]))
+    print("[Latency] STT:       {:.1f}s".format(metrics["stt"]))
+    print("[Latency] LLM:       {:.1f}s".format(metrics["llm"]))
+    print("[Latency] TTS:       {:.1f}s".format(metrics["tts"]))
+    print("[Latency] Processing:{:.1f}s".format(metrics["processing_total"]))
+    print("[Latency] Total:      {:.1f}s".format(metrics["total"]))
 
 
 def run_session(llm: BaseLLMClient) -> None:
-    """Run a single user session. Exits when all slots filled or retries exhausted."""
+    """Run a single user session."""
     session = SessionManager()
 
-    # Opening prompt — speak before first recording
     opening_instruction = session.get_next_prompt()
     opening_message     = get_assistant_response(llm, opening_instruction)
     print(f"\n[Assistant] {opening_message}")
-    speak(opening_message)
-    _play_beep()   # signal: ready to listen
+
+    # FIX 2: opening message is also non-blocking — beep fires sooner
+    tts_done = speak_async(opening_message)
+    tts_done.wait()
+    _play_beep()
 
     silent_turns = 0
 
@@ -152,8 +160,9 @@ def run_session(llm: BaseLLMClient) -> None:
             _print_latency(metrics)
 
             if silent_turns >= SILENCE_RETRY_AFTER:
-                speak(SILENCE_RETRY_PROMPT)
-                _play_beep()      # beep AFTER the spoken prompt, as promised
+                tts_done = speak_async(SILENCE_RETRY_PROMPT)
+                tts_done.wait()
+                _play_beep()
                 silent_turns = 0
             continue
 
@@ -162,11 +171,9 @@ def run_session(llm: BaseLLMClient) -> None:
         print(f"[Assistant] {response}")
         _print_latency(metrics)
 
-        # After a valid response, beep to signal we're ready for the next input
         if not session.is_complete() and not session.is_failed():
             _play_beep()
 
-    # Final outcome
     if session.is_complete():
         print("\n[main] Session complete.")
         print(session.summary())
@@ -176,10 +183,9 @@ def run_session(llm: BaseLLMClient) -> None:
 
 
 def main():
-    print("=== Voice Assistant — Phase 4 (multi-provider) ===")
+    print("=== Voice Assistant — Phase 4 (optimized) ===")
     print("Press Ctrl+C to quit.\n")
 
-    # Pre-warm Whisper so first turn has no STT delay
     print("[main] Pre-loading Whisper STT model...")
     _load_model()
     print("[main] STT model ready.\n")

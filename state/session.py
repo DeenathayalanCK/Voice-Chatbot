@@ -27,34 +27,32 @@ SLOTS = ["name", "phone"]
 # Max attempts per field before the session is abandoned
 MAX_RETRIES = 3
 
+# FIX 3 — Keep all LLM responses under ~10 words to minimize TTS duration.
+# The instruction suffix "Reply in 10 words or fewer." is appended to every prompt.
+
+_SHORT = " Reply in 10 words or fewer."
+
 # LLM instructions to ask for each field
 SLOT_PROMPTS = {
-    "name":  "Ask the user for their full name in one short sentence. Do not suggest example names.",
-    "phone": "Ask the user for their 10-digit phone number and ask them to say digits one by one clearly.",
+    "name":  "Ask the user for their full name." + _SHORT,
+    "phone": "Ask the user for their 10-digit phone number, digits one by one." + _SHORT,
 }
 
 # LLM instructions to acknowledge a successfully filled field
 SLOT_ACK = {
-    "name":  "Acknowledge that you've noted the user's name: '{value}'. Keep it brief.",
-    "phone": "Acknowledge that you've noted the user's phone number: '{value}'. Then say goodbye warmly.",
+    "name":  "Briefly confirm you got the name '{value}'." + _SHORT,
+    "phone": "Briefly confirm you got the number '{value}'. Say goodbye." + _SHORT,
 }
 
 # LLM instructions to re-ask after a validation failure
 SLOT_RETRY_PROMPTS = {
-    "name": (
-        "Tell the user you need only their name. Ask them to say just their name, clearly, "
-        "without extra words."
-    ),
-    "phone": (
-        "Tell the user their phone number was invalid — it must be exactly 10 digits. "
-        "Ask them to repeat only digits, one by one, with a short pause between groups."
-    ),
+    "name":  "Ask for their name only — no extra words." + _SHORT,
+    "phone": "Say the number was invalid. Ask for 10 digits again." + _SHORT,
 }
 
 # LLM instruction when a user exhausts all retries for a field
 SLOT_EXCEEDED_PROMPT = (
-    "Apologise and tell the user you were unable to collect a valid phone number "
-    "after several attempts. End the conversation politely."
+    "Apologise briefly. Say you could not collect the number. End the call." + _SHORT
 )
 
 
