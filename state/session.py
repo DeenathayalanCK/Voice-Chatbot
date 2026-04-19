@@ -1,7 +1,77 @@
-# state/session.py — Phase 4: slot-filling + validation + retry logic
-# Phase 3 flow unchanged. Adds validators, retry counters, and failure handling.
+# state/session.py — slot-filling, validation, retry logic
+#
+# RESPONSE_MODE awareness
+# ───────────────────────
+# When RESPONSE_MODE=deterministic, get_next_prompt() returns a short *key*
+# (e.g. "ask.name", "ack.name|Ravi Kumar") that DeterministicClient resolves
+# to a scripted string — no LLM call, zero latency.
+#
+# When RESPONSE_MODE=llm, get_next_prompt() returns a natural-language
+# instruction that the configured LLM paraphrases into a spoken response
+# (original behaviour — fully backward compatible).
+#
+# Adding a new slot (both modes)
+# ──────────────────────────────
+# 1. Append the slot name to SLOTS below.
+# 2. Add a validator to VALIDATORS (or set None for free-form).
+# 3. For LLM mode: add entries to SLOT_PROMPTS, SLOT_ACK, SLOT_RETRY_PROMPTS.
+# 4. For deterministic mode: add matching keys to responses/responses.yaml.
+#    Required keys:  ask.<slot>  ack.<slot>  retry.<slot>  exceeded.<slot>
 
+from __future__ import annotations
+
+import os
 import re
+
+# ── Ordered slot definitions ─────────────────────────────────────────────────
+# Add new slots here. Order determines collection sequence.
+SLOTS = ["name", "phone"]
+
+MAX_RETRIES = 3   # attempts per field before session is abandoned
+
+# ── Response-mode detection ──────────────────────────────────────────────────
+def _is_deterministic() -> bool:
+    return os.getenv("RESPONSE_MODE", "llm").strip().lower() == "deterministic"
+
+# ── LLM-mode prompt strings ──────────────────────────────────────────────────
+# Used only when RESPONSE_MODE=llm.
+_SHORT = " Reply in 10 words or fewer."
+
+SLOT_PROMPTS_LLM = {
+    "name":  "Ask the user for their full name." + _SHORT,
+    "phone": "Ask the user for their 10-digit phone number, digits one by one." + _SHORT,
+}
+SLOT_ACK_LLM = {
+    "name":  "Briefly confirm you got the name '{value}'." + _SHORT,
+    "phone": "Briefly confirm you got the number '{value}'. Say goodbye." + _SHORT,
+}
+SLOT_RETRY_LLM = {
+    "name":  "Ask for their name only — no extra words." + _SHORT,
+    "phone": "Say the number was invalid. Ask for 10 digits again." + _SHORT,
+}
+SLOT_EXCEEDED_LLM = (
+    "Apologise briefly. Say you could not collect the number. End the call." + _SHORT
+)
+
+# ── Deterministic-mode prompt keys ───────────────────────────────────────────
+# Keys must exist in responses/responses.yaml.
+# Value substitution: "ack.<slot>|<value>" → script["ack.<slot>"].format(value=...)
+SLOT_PROMPTS_DET = {
+    "name":  "ask.name",
+    "phone": "ask.phone",
+}
+SLOT_ACK_DET = {
+    "name":  "ack.name",   # pipe-joined with value at runtime: "ack.name|Ravi"
+    "phone": "ack.phone",
+}
+SLOT_RETRY_DET = {
+    "name":  "retry.name",
+    "phone": "retry.phone",
+}
+SLOT_EXCEEDED_DET = "exceeded.phone"   # generic exceeded key
+
+
+# ── Shared normalization / validation ─────────────────────────────────────────
 
 NUMBER_WORDS = {
     "zero": "0", "oh": "0", "o": "0",
@@ -21,86 +91,28 @@ NAME_BANNED_TOKENS = {
     "maybe", "or", "what", "whats", "what's", "please", "provide",
 }
 
-# Ordered list of fields to collect
-SLOTS = ["name", "phone"]
-
-# Max attempts per field before the session is abandoned
-MAX_RETRIES = 3
-
-# FIX 3 — Keep all LLM responses under ~10 words to minimize TTS duration.
-# The instruction suffix "Reply in 10 words or fewer." is appended to every prompt.
-
-_SHORT = " Reply in 10 words or fewer."
-
-# LLM instructions to ask for each field
-SLOT_PROMPTS = {
-    "name":  "Ask the user for their full name." + _SHORT,
-    "phone": "Ask the user for their 10-digit phone number, digits one by one." + _SHORT,
-}
-
-# LLM instructions to acknowledge a successfully filled field
-SLOT_ACK = {
-    "name":  "Briefly confirm you got the name '{value}'." + _SHORT,
-    "phone": "Briefly confirm you got the number '{value}'. Say goodbye." + _SHORT,
-}
-
-# LLM instructions to re-ask after a validation failure
-SLOT_RETRY_PROMPTS = {
-    "name":  "Ask for their name only — no extra words." + _SHORT,
-    "phone": "Say the number was invalid. Ask for 10 digits again." + _SHORT,
-}
-
-# LLM instruction when a user exhausts all retries for a field
-SLOT_EXCEEDED_PROMPT = (
-    "Apologise briefly. Say you could not collect the number. End the call." + _SHORT
-)
-
-
-# ---------------------------------------------------------------------------
-# Validators — return True if the value is acceptable
-# ---------------------------------------------------------------------------
-
-def _validate_phone(value: str) -> bool:
-    """10 digits, numeric only (spaces/dashes stripped before check)."""
-    digits = _normalize_phone(value)
-    return digits.isdigit() and len(digits) == 10
-
 
 def _normalize_name(value: str) -> str:
-    """Normalize name text by removing conversational prefixes and punctuation noise."""
     text = value.strip()
     lower = text.lower()
-
-    prefixes = [
-        "my name is ",
-        "this is ",
-        "i am ",
-        "i'm ",
-        "call me ",
-    ]
-    for prefix in prefixes:
+    for prefix in ("my name is ", "this is ", "i am ", "i'm ", "call me "):
         if lower.startswith(prefix):
             text = text[len(prefix):]
             break
-
     text = re.sub(r"[^a-zA-Z'\-\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip(" .,-")
-
-    parts = [p for p in text.split(" ") if p]
+    parts = [p for p in text.split() if p]
     return " ".join(p.capitalize() for p in parts)
 
 
 def _validate_name(value: str) -> bool:
-    """Accept 1-4 realistic name tokens; reject conversational phrases."""
     if not value:
         return False
     if any(ch.isdigit() for ch in value):
         return False
-
     parts = value.lower().split()
-    if len(parts) < 1 or len(parts) > 4:
+    if not (1 <= len(parts) <= 4):
         return False
-
     for token in parts:
         if token in NAME_BANNED_TOKENS:
             return False
@@ -108,183 +120,183 @@ def _validate_name(value: str) -> bool:
             return False
         if len(token.strip("'-")) < 2:
             return False
-
     return True
 
 
 def _normalize_phone(value: str) -> str:
-    """Normalize spoken or formatted phone input to a digit-only string."""
+    """
+    Normalize spoken or formatted phone input to a digit-only string.
+    Caps result at 10 digits — ignores trailing hallucinated content.
+    """
+    # Fast path: pure digit string (or digit+punctuation like dashes)
     raw_digits = re.sub(r"\D", "", value)
-    if len(raw_digits) == 10:
-        return raw_digits
+    if raw_digits:
+        # Strip known country-code prefixes first
+        if len(raw_digits) >= 11 and raw_digits.startswith("0"):
+            raw_digits = raw_digits[1:]
+        if len(raw_digits) >= 12 and raw_digits.startswith("91"):
+            raw_digits = raw_digits[2:]
+        # Cap at 10 — any extra digits are hallucinated prose (e.g. "10 digit")
+        return raw_digits[:10]
 
-    if len(raw_digits) == 11 and raw_digits.startswith("0"):
-        return raw_digits[1:]
-
-    if len(raw_digits) == 12 and raw_digits.startswith("91"):
-        return raw_digits[-10:]
-
+    # Slow path: parse number words
     tokens = re.findall(r"[a-zA-Z0-9]+", value.lower())
     converted: list[str] = []
     i = 0
     while i < len(tokens):
         token = tokens[i]
-
         if token in {"double", "triple"} and i + 1 < len(tokens):
-            next_token = tokens[i + 1]
-            next_digit = NUMBER_WORDS.get(next_token)
+            next_digit = NUMBER_WORDS.get(tokens[i + 1])
             if next_digit is not None:
                 count = 2 if token == "double" else 3
                 converted.extend([next_digit] * count)
                 i += 2
                 continue
-
         if token.isdigit():
-            converted.append(token)
+            converted.extend(list(token))
         else:
             mapped = NUMBER_WORDS.get(token)
             if mapped is not None:
                 converted.append(mapped)
-
         i += 1
 
     normalized = "".join(converted)
-    if len(normalized) == 11 and normalized.startswith("0"):
-        return normalized[1:]
-    if len(normalized) == 12 and normalized.startswith("91"):
-        return normalized[-10:]
-    return normalized
+    if len(normalized) >= 11 and normalized.startswith("0"):
+        normalized = normalized[1:]
+    if len(normalized) >= 12 and normalized.startswith("91"):
+        normalized = normalized[2:]
+    return normalized[:10]
+
+
+def _validate_phone(value: str) -> bool:
+    digits = _normalize_phone(value)
+    return digits.isdigit() and len(digits) == 10
 
 
 VALIDATORS = {
-    "name": _validate_name,
+    "name":  _validate_name,
     "phone": _validate_phone,
 }
 
+NORMALIZERS = {
+    "name":  _normalize_name,
+    "phone": _normalize_phone,
+}
 
-# ---------------------------------------------------------------------------
-# SessionManager
-# ---------------------------------------------------------------------------
+
+# ── SessionManager ────────────────────────────────────────────────────────────
 
 class SessionManager:
     """
-    Manages slot-filling state with per-field validation and retry limits.
+    Manages slot-filling state: collection order, validation, retries.
 
-    Public API (unchanged from Phase 3):
-        update(user_text)       — try to store text into the current slot
-        get_next_prompt() -> str — LLM instruction for the next turn
-        is_complete()     -> bool
-        is_failed()       -> bool — True if retries were exhausted
-        summary()         -> str
+    get_next_prompt() returns:
+      • a YAML key string  when RESPONSE_MODE=deterministic
+      • an LLM instruction when RESPONSE_MODE=llm
+    Both forms are passed directly into the client's generate_response().
     """
 
-    def __init__(self):
-        self.state: dict[str, str | None] = {slot: None for slot in SLOTS}
-        self._retries: dict[str, int]     = {slot: 0 for slot in SLOTS}
-        self._just_filled: str | None     = None   # slot acked on next prompt
-        self._failed: bool                = False  # True if MAX_RETRIES exceeded
-        self._pending_instruction: str | None = None  # override next prompt
+    def __init__(self) -> None:
+        self.state:    dict[str, str | None] = {s: None for s in SLOTS}
+        self._retries: dict[str, int]        = {s: 0    for s in SLOTS}
+        self._just_filled:         str | None = None
+        self._failed:              bool       = False
+        self._pending_instruction: str | None = None
+        self._det = _is_deterministic()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    # ── Public API ──────────────────────────────────────────────────────────
 
     def update(self, user_text: str) -> None:
-        """
-        Validate and store user_text into the current empty slot.
-        If validation fails, increments retry counter.
-        If retries are exhausted, marks session as failed.
-        """
         slot = self._current_slot()
         if not slot:
             return
 
-        value = user_text.strip()
-        if slot == "name":
-            value = _normalize_name(value)
-        if slot == "phone":
-            value = _normalize_phone(value)
+        normalizer = NORMALIZERS.get(slot)
+        value = normalizer(user_text) if normalizer else user_text.strip()
 
-        # Run validator if one exists for this slot
         validator = VALIDATORS.get(slot)
         if validator and not validator(value):
             self._retries[slot] += 1
-
             if self._retries[slot] >= MAX_RETRIES:
-                # Retries exhausted — mark session failed
                 self._failed = True
-                self._pending_instruction = SLOT_EXCEEDED_PROMPT
+                self._pending_instruction = (
+                    f"exceeded.{slot}" if self._det else SLOT_EXCEEDED_LLM
+                )
             else:
-                # Ask again with a validation-specific retry prompt
-                retry_prompt = SLOT_RETRY_PROMPTS.get(slot)
-                if retry_prompt:
-                    self._pending_instruction = retry_prompt
-            print(f"[state] Invalid {slot} input: {user_text}")
-            return  # do NOT fill the slot
+                self._pending_instruction = (
+                    SLOT_RETRY_DET.get(slot, "retry.fallback")
+                    if self._det
+                    else SLOT_RETRY_LLM.get(slot, "")
+                )
+            print(f"[state] Invalid {slot}: '{user_text}' → '{value}'")
+            return
 
-        # Valid (or no validator) — store and queue acknowledgement
         self.state[slot] = value
         print(f"[state] Captured {slot}: {value}")
         self._just_filled = slot
-        self._pending_instruction = None   # clear any pending retry message
+        self._pending_instruction = None
 
     def get_next_prompt(self) -> str:
         """
-        Return an LLM instruction string for the current turn.
-        Priority: pending override -> ack (+ chained next-slot) -> next slot prompt.
-
-        FIX: When acknowledging a filled slot, we immediately chain the next-slot
-        question into the same instruction. Without this, the recorder starts
-        listening *before* the user ever hears what they are supposed to say next,
-        causing a silent gap and confused captures.
+        Returns a prompt key (deterministic) or LLM instruction (llm mode).
+        Priority: pending override → ack+next → ask next slot → complete.
         """
-        # Pending override (retry message or failure message)
+        # 1. Pending override (retry / exceeded)
         if self._pending_instruction:
-            instruction = self._pending_instruction
+            out = self._pending_instruction
             self._pending_instruction = None
-            return instruction
+            return out
 
-        # Acknowledge the last successfully filled slot, then immediately ask next
+        # 2. Acknowledge just-filled slot, then chain next question
         if self._just_filled:
-            ack_template = SLOT_ACK[self._just_filled]
-            ack = ack_template.format(value=self.state[self._just_filled])
+            filled_slot  = self._just_filled
+            filled_value = self.state[filled_slot]
             self._just_filled = None
-
-            # Chain the next-slot question so the user hears it before recording starts
             next_slot = self._current_slot()
-            if next_slot:
-                return (
-                    f"{ack} "
-                    f"Then immediately ask: {SLOT_PROMPTS[next_slot]}"
-                )
-            return ack  # last slot filled — ack only (session will complete)
 
-        # Ask for the next empty slot
+            if self._det:
+                # Return "ack.<slot>|<value>" — DeterministicClient splits on "|"
+                ack_key = SLOT_ACK_DET.get(filled_slot, f"ack.{filled_slot}")
+                ack = f"{ack_key}|{filled_value}"
+                # If there's a next slot, chain it in a second call naturally —
+                # deterministic mode returns one crisp sentence so no chaining needed.
+                # The next loop iteration will call get_next_prompt() → ask.next_slot.
+                return ack
+            else:
+                # LLM mode: chain ack + next question into one instruction
+                ack_tmpl = SLOT_ACK_LLM.get(filled_slot, "")
+                ack = ack_tmpl.format(value=filled_value)
+                if next_slot:
+                    next_q = SLOT_PROMPTS_LLM.get(next_slot, "")
+                    return f"{ack} Then immediately ask: {next_q}"
+                return ack
+
+        # 3. Ask for the next unfilled slot
         slot = self._current_slot()
         if slot:
-            return SLOT_PROMPTS[slot]
+            return (
+                SLOT_PROMPTS_DET.get(slot, f"ask.{slot}")
+                if self._det
+                else SLOT_PROMPTS_LLM.get(slot, "")
+            )
 
-        return "Thank the user and let them know the conversation is complete."
+        # 4. All done
+        return "complete" if self._det else "Thank the user — conversation is complete."
 
     def current_slot(self) -> str | None:
-        """Expose the active slot so upstream components can adapt behavior."""
         return self._current_slot()
 
     def is_complete(self) -> bool:
-        """True when all slots are filled successfully."""
-        return all(self.state[slot] is not None for slot in SLOTS)
+        return all(self.state[s] is not None for s in SLOTS)
 
     def is_failed(self) -> bool:
-        """True if a field exhausted its retry limit."""
         return self._failed
 
     def summary(self) -> str:
         lines = [f"  {k}: {v}" for k, v in self.state.items()]
         return "Collected details:\n" + "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    # ── Internal ────────────────────────────────────────────────────────────
 
     def _current_slot(self) -> str | None:
         for slot in SLOTS:

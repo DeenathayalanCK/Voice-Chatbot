@@ -18,7 +18,7 @@ import numpy as np
 # ── Tune this to your mic ──────────────────────────────────────────────────
 # Too LOW  → fires on noise, Whisper gets garbage audio, STT returns ""
 # Too HIGH → misses quiet speech
-SILENCE_THRESHOLD = 300    # RMS energy below this = silence (was 500, which is paradoxically too sensitive)
+SILENCE_THRESHOLD = 800   # RMS energy below this = silence (was 500, which is paradoxically too sensitive)
 
 # Seconds of sustained silence before recording stops
 SILENCE_DURATION  = 1.5    # slightly tighter than 2 s for snappier UX

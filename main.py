@@ -27,7 +27,7 @@ from stt.stt import transcribe, _load_model
 from llm.factory import get_llm_client
 from llm.base import BaseLLMClient
 from state.session import SessionManager
-from tts.tts import speak
+from tts.tts import speak, speak_with_timings, warmup_tts
 
 # ── Silence retry config ───────────────────────────────────────────────────
 SILENCE_RETRY_AFTER  = 1
@@ -81,6 +81,8 @@ def run_turn(llm: BaseLLMClient, session: SessionManager) -> tuple[str, str, dic
         "user_wait": 0.0,
         "stt":       0.0,
         "llm":       0.0,
+        "tts_infer": 0.0,
+        "tts_speak": 0.0,
         "tts":       0.0,
         "processing_total": 0.0,
         "total":     0.0,
@@ -91,11 +93,15 @@ def run_turn(llm: BaseLLMClient, session: SessionManager) -> tuple[str, str, dic
 
     listen_start = perf_counter()
     if active_slot == "name":
-        audio = record_audio(silence_duration=1.8, min_speech_frames=5,
+        # Name: allow natural pauses between first/last name (~1.2 s)
+        audio = record_audio(silence_duration=1.2, min_speech_frames=5,
                               pre_roll_chunks=6, vad_threshold=260)
     elif active_slot == "phone":
-        audio = record_audio(silence_duration=2.4, min_speech_frames=4,
-                              pre_roll_chunks=8, vad_threshold=220)
+        # Phone: digits are spoken quickly; 0.8 s silence = utterance done.
+        # 2.4 s was causing 56–75 s recordings because Whisper hallucinations
+        # kept the VAD loop alive through inter-digit pauses.
+        audio = record_audio(silence_duration=0.8, min_speech_frames=4,
+                              pre_roll_chunks=4, vad_threshold=220)
     else:
         audio = record_audio()
     metrics["user_wait"] = perf_counter() - listen_start
@@ -116,11 +122,11 @@ def run_turn(llm: BaseLLMClient, session: SessionManager) -> tuple[str, str, dic
     assistant_text = get_assistant_response(llm, instruction)
     metrics["llm"] = perf_counter() - llm_start
 
-    # FIX 2 — speak in background; wait for it to finish before returning
-    tts_start  = perf_counter()
-    tts_done   = speak_async(assistant_text)
-    tts_done.wait()                          # blocks until audio ends
-    metrics["tts"] = perf_counter() - tts_start
+    # Timed TTS breakdown: generation/inference vs audible playback.
+    tts_metrics = speak_with_timings(assistant_text)
+    metrics["tts_infer"] = tts_metrics.get("inference", 0.0)
+    metrics["tts_speak"] = tts_metrics.get("speaking", 0.0)
+    metrics["tts"]       = tts_metrics.get("total", 0.0)
 
     metrics["processing_total"] = metrics["stt"] + metrics["llm"] + metrics["tts"]
     metrics["total"]            = perf_counter() - turn_start
@@ -131,7 +137,9 @@ def _print_latency(metrics: dict[str, float]) -> None:
     print("[Latency] User wait: {:.1f}s".format(metrics["user_wait"]))
     print("[Latency] STT:       {:.1f}s".format(metrics["stt"]))
     print("[Latency] LLM:       {:.1f}s".format(metrics["llm"]))
-    print("[Latency] TTS:       {:.1f}s".format(metrics["tts"]))
+    print("[Latency] TTS infer: {:.1f}s".format(metrics["tts_infer"]))
+    print("[Latency] TTS speak: {:.1f}s".format(metrics["tts_speak"]))
+    print("[Latency] TTS total: {:.1f}s".format(metrics["tts"]))
     print("[Latency] Processing:{:.1f}s".format(metrics["processing_total"]))
     print("[Latency] Total:      {:.1f}s".format(metrics["total"]))
 
@@ -186,9 +194,30 @@ def main():
     print("=== Voice Assistant — Phase 4 (optimized) ===")
     print("Press Ctrl+C to quit.\n")
 
-    print("[main] Pre-loading Whisper STT model...")
-    _load_model()
-    print("[main] STT model ready.\n")
+    # Warm up STT and TTS in parallel — both are slow to initialise.
+    # STT: Whisper loads the ONNX model into RAM.
+    # TTS: Piper spawns its persistent process and loads its ONNX voice model.
+    # Running them concurrently cuts startup time roughly in half.
+    stt_ready = threading.Event()
+    tts_ready = threading.Event()
+
+    def _load_stt():
+        print("[main] Pre-loading Whisper STT model...")
+        _load_model()
+        print("[main] STT model ready.")
+        stt_ready.set()
+
+    def _load_tts():
+        print("[main] Pre-loading Piper TTS process...")
+        warmup_tts()
+        tts_ready.set()
+
+    threading.Thread(target=_load_stt, daemon=True).start()
+    threading.Thread(target=_load_tts, daemon=True).start()
+
+    stt_ready.wait()
+    tts_ready.wait()
+    print("[main] All models ready.\n")
 
     llm = get_llm_client()
 

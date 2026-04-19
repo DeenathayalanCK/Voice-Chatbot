@@ -1,0 +1,35 @@
+# responses/responses.yaml
+#
+# Deterministic response script for the voice assistant.
+# Each key maps to an exact string spoken/returned to the user.
+#
+# ── How to expand ─────────────────────────────────────────────────────────
+# 1. Add a new slot to SLOTS in state/session.py  (e.g. "email")
+# 2. Add matching keys here following the naming convention:
+#      ask.<slot>          — initial question for the slot
+#      ack.<slot>          — confirmation after slot is filled  ({value} substituted)
+#      retry.<slot>        — re-ask after a validation failure
+#      exceeded.<slot>     — slot exhausted all retries
+#      complete            — all slots collected successfully
+# 3. No code changes needed — DeterministicClient reads keys at runtime.
+# ──────────────────────────────────────────────────────────────────────────
+
+# ── Greeting ──────────────────────────────────────────────────────────────
+ask.name: "Could you please tell me your full name?"
+
+# ── Name slot ─────────────────────────────────────────────────────────────
+ack.name: "Got it, {value}. And your phone number?"
+retry.name: "Sorry, I didn't catch that. Could you say your full name again?"
+exceeded.name: "I'm sorry, I wasn't able to capture your name. Please try again later."
+
+# ── Phone slot ─────────────────────────────────────────────────────────────
+ask.phone: "Please say your 10-digit phone number."
+ack.phone: "Perfect, I've noted {value}. Thank you and goodbye!"
+retry.phone: "That didn't sound like a valid 10-digit number. Please try again."
+exceeded.phone: "I'm sorry, I couldn't capture your phone number. Goodbye."
+
+# ── Session end ────────────────────────────────────────────────────────────
+complete: "Thank you! I have all your details. Have a great day!"
+
+# ── Generic fallback (should never be reached in normal flow) ──────────────
+fallback: "I'm sorry, I didn't understand that. Could you please repeat?"
